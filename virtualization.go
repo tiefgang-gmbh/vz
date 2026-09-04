@@ -97,6 +97,9 @@ type VirtualMachine struct {
 	disconnectedIn        *infinity.Channel[*disconnected]
 	disconnectedOut       *infinity.Channel[*DisconnectedError]
 	watchDisconnectedOnce sync.Once
+	// watching reports whether NetworkDeviceAttachmentWasDisconnected
+	// handed disconnectedOut to a caller; guarded by mu.
+	watching bool
 
 	finalizeOnce sync.Once
 
@@ -108,6 +111,9 @@ type VirtualMachine struct {
 type machineState struct {
 	state       VirtualMachineState
 	stateNotify *infinity.Channel[VirtualMachineState]
+	// subscribed reports whether StateChangedNotify handed stateNotify
+	// to a caller; guarded by mu.
+	subscribed bool
 
 	mu sync.RWMutex
 }
@@ -158,6 +164,7 @@ func NewVirtualMachine(config *VirtualMachineConfiguration) (*VirtualMachine, er
 	objc.SetFinalizer(v, func(self *VirtualMachine) {
 		self.finalize()
 		stateHandle.Delete()
+		self.closeNotifications()
 	})
 	return v, nil
 }
@@ -165,8 +172,45 @@ func NewVirtualMachine(config *VirtualMachineConfiguration) (*VirtualMachine, er
 func (v *VirtualMachine) finalize() {
 	v.finalizeOnce.Do(func() {
 		objc.ReleaseDispatch(v.dispatchQueue)
+		// When this drops the last reference the machine is
+		// deallocated: its KVO observer is removed and its disconnect
+		// handler released, whose dealloc closes disconnectedIn.
 		objc.Release(v)
 	})
+}
+
+// closeNotifications ends the notification channels once the Go
+// wrapper is being collected: the state handle is gone by then, so no
+// state change can be delivered any more, and nothing can subscribe.
+// Each channel's buffer goroutine exits once its input is closed and
+// its buffer drained; a subscriber drains its own channel, an
+// unsubscribed one is drained here so that a machine nobody listened
+// to leaves no goroutine behind.
+func (v *VirtualMachine) closeNotifications() {
+	v.machineState.mu.Lock()
+	subscribed := v.machineState.subscribed
+	v.machineState.mu.Unlock()
+	v.machineState.stateNotify.Close()
+	if !subscribed {
+		go drain(v.machineState.stateNotify.Out())
+	}
+
+	v.mu.RLock()
+	watching := v.watching
+	v.mu.RUnlock()
+	if !watching {
+		in, out := v.disconnectedIn, v.disconnectedOut
+		go func() {
+			watchDisconnected(in, out, nil)
+			drain(out.Out())
+		}()
+	}
+}
+
+// drain consumes ch until it is closed.
+func drain[T any](ch <-chan T) {
+	for range ch {
+	}
 }
 
 // SocketDevices return the list of socket devices configured on this virtual machine.
@@ -228,9 +272,15 @@ func (v *VirtualMachine) State() VirtualMachineState {
 }
 
 // StateChangedNotify gets notification is changed execution state of the virtual machine.
+//
+// The channel is closed once the VirtualMachine has been garbage
+// collected; the caller is expected to keep receiving until then, and
+// to receive with the two-value form, since a closed channel yields the
+// zero value VirtualMachineStateStopped.
 func (v *VirtualMachine) StateChangedNotify() <-chan VirtualMachineState {
-	v.machineState.mu.RLock()
-	defer v.machineState.mu.RUnlock()
+	v.machineState.mu.Lock()
+	defer v.machineState.mu.Unlock()
+	v.machineState.subscribed = true
 	return v.machineState.stateNotify.Out()
 }
 
@@ -465,32 +515,38 @@ type disconnected struct {
 // typically triggered by events such as failure to start, initial boot, device reset, or reboot.
 // As a result, this method may be invoked multiple times throughout the virtual machine's lifecycle.
 //
+// The channel is closed once the VirtualMachine has been garbage
+// collected; the caller is expected to keep receiving until then, and
+// to receive with the two-value form, since a closed channel yields a
+// nil *DisconnectedError.
+//
 // This is only supported on macOS 12 and newer, error will be returned on older versions.
 func (v *VirtualMachine) NetworkDeviceAttachmentWasDisconnected() (<-chan *DisconnectedError, error) {
 	if err := macOSAvailable(12); err != nil {
 		return nil, err
 	}
 	v.watchDisconnectedOnce.Do(func() {
-		go v.watchDisconnected()
+		v.mu.Lock()
+		v.watching = true
+		v.mu.Unlock()
+		// The watcher must not hold v: it runs until the machine is
+		// deallocated, which needs v to be collectable.
+		go watchDisconnected(v.disconnectedIn, v.disconnectedOut, v.config.networkDeviceConfiguration)
 	})
 	return v.disconnectedOut.Out(), nil
 }
 
-// TODO(codehex): refactoring to leave using machineState's mutex lock.
-func (v *VirtualMachine) watchDisconnected() {
-	for disconnected := range v.disconnectedIn.Out() {
-		v.mu.RLock()
-		config := sliceutil.FindValueByIndex(
-			v.config.networkDeviceConfiguration,
-			disconnected.index,
-		)
-		v.mu.RUnlock()
-		v.disconnectedOut.In() <- &DisconnectedError{
+// watchDisconnected forwards disconnect events from the delegate's inbox
+// to the caller's channel until the inbox is closed by the delegate's
+// dealloc, then closes the caller's channel.
+func watchDisconnected(in *infinity.Channel[*disconnected], out *infinity.Channel[*DisconnectedError], configs []*VirtioNetworkDeviceConfiguration) {
+	for disconnected := range in.Out() {
+		out.In() <- &DisconnectedError{
 			Err:    disconnected.err,
-			Config: config,
+			Config: sliceutil.FindValueByIndex(configs, disconnected.index),
 		}
 	}
-	v.disconnectedOut.Close()
+	out.Close()
 }
 
 //export emitAttachmentWasDisconnected
@@ -513,4 +569,7 @@ func closeAttachmentWasDisconnectedChannel(cgoHandleUintptr C.uintptr_t) {
 	// if caused panic, that's unexpected behavior.
 	ch, _ := handler.Value().(*infinity.Channel[*disconnected])
 	ch.Close()
+	// The handler is being deallocated: nothing will emit through this
+	// handle again.
+	handler.Delete()
 }

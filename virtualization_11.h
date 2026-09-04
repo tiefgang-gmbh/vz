@@ -35,7 +35,8 @@ void closeAttachmentWasDisconnectedChannel(uintptr_t cgoHandle);
 @interface ObservableVZVirtualMachine : VZVirtualMachine
 - (instancetype)initWithConfiguration:(VZVirtualMachineConfiguration *)configuration
                                 queue:(dispatch_queue_t)queue
-                   statusUpdateHandle:(uintptr_t)statusUpdateHandle;
+                   statusUpdateHandle:(uintptr_t)statusUpdateHandle
+                   disconnectedHandle:(uintptr_t)disconnectedHandle;
 - (void)dealloc;
 @end
 

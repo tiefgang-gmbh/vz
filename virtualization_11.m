@@ -22,9 +22,15 @@
 {
     self = [super init];
     if (self) {
-        _delegates = [NSHashTable weakObjectsHashTable];
+        _delegates = [[NSHashTable weakObjectsHashTable] retain];
     }
     return self;
+}
+
+- (void)dealloc
+{
+    [_delegates release];
+    [super dealloc];
 }
 
 - (void)addDelegate:(id<VZVirtualMachineDelegate>)delegate
@@ -102,10 +108,12 @@
 @implementation ObservableVZVirtualMachine {
     Observer *_observer;
     VZVirtualMachineDelegateWrapper *_delegateWrapper;
+    NetworkDeviceDisconnectedHandler *_disconnectedHandler;
 };
 - (instancetype)initWithConfiguration:(VZVirtualMachineConfiguration *)configuration
                                 queue:(dispatch_queue_t)queue
                    statusUpdateHandle:(uintptr_t)statusUpdateHandle
+                   disconnectedHandle:(uintptr_t)disconnectedHandle
 {
     self = [super initWithConfiguration:configuration queue:queue];
     if (self) {
@@ -116,6 +124,11 @@
                   context:(void *)statusUpdateHandle];
         _delegateWrapper = [[VZVirtualMachineDelegateWrapper alloc] init];
         [super setDelegate:_delegateWrapper];
+        // The wrapper only holds its delegates weakly, so the machine
+        // owns this one: it lives exactly as long as the machine, and
+        // its dealloc closes the Go side's disconnect channel.
+        _disconnectedHandler = [[NetworkDeviceDisconnectedHandler alloc] initWithHandle:disconnectedHandle];
+        [_delegateWrapper addDelegate:_disconnectedHandler];
     }
     return self;
 }
@@ -137,6 +150,7 @@
     [self removeObserver:_observer forKeyPath:@"state"];
     [_observer release];
     [_delegateWrapper release];
+    [_disconnectedHandler release];
     [super dealloc];
 }
 @end
@@ -846,13 +860,11 @@ VZVirtioSocketConnectionFlat convertVZVirtioSocketConnection2Flat(void *connecti
 void *newVZVirtualMachineWithDispatchQueue(void *config, void *queue, uintptr_t statusUpdateCgoHandle, uintptr_t disconnectedCgoHandle)
 {
     if (@available(macOS 11, *)) {
-        ObservableVZVirtualMachine *vm = [[ObservableVZVirtualMachine alloc]
+        return [[ObservableVZVirtualMachine alloc]
             initWithConfiguration:(VZVirtualMachineConfiguration *)config
                             queue:(dispatch_queue_t)queue
-               statusUpdateHandle:statusUpdateCgoHandle];
-        NetworkDeviceDisconnectedHandler *delegate = [[NetworkDeviceDisconnectedHandler alloc] initWithHandle:disconnectedCgoHandle];
-        [vm setDelegate:[delegate autorelease]];
-        return vm;
+               statusUpdateHandle:statusUpdateCgoHandle
+               disconnectedHandle:disconnectedCgoHandle];
     }
 
     RAISE_UNSUPPORTED_MACOS_EXCEPTION();

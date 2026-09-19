@@ -5,6 +5,7 @@
 //
 
 #import "virtualization_11.h"
+#import <stdatomic.h>
 
 @implementation Observer
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context;
@@ -109,6 +110,9 @@
     Observer *_observer;
     VZVirtualMachineDelegateWrapper *_delegateWrapper;
     NetworkDeviceDisconnectedHandler *_disconnectedHandler;
+    // Cleared by whoever removes the observer first: removing an
+    // observer twice raises.
+    atomic_bool _observingState;
 };
 - (instancetype)initWithConfiguration:(VZVirtualMachineConfiguration *)configuration
                                 queue:(dispatch_queue_t)queue
@@ -122,6 +126,7 @@
                forKeyPath:@"state"
                   options:NSKeyValueObservingOptionNew
                   context:(void *)statusUpdateHandle];
+        atomic_init(&_observingState, true);
         _delegateWrapper = [[VZVirtualMachineDelegateWrapper alloc] init];
         [super setDelegate:_delegateWrapper];
         // The wrapper only holds its delegates weakly, so the machine
@@ -145,9 +150,21 @@
     return _delegateWrapper;
 }
 
+// The observer's context is a cgo handle owned by the Go wrapper, and
+// the machine can outlive that wrapper: the framework retains a machine
+// that is starting or stopping, and so does a pending completion block.
+// The wrapper's finalizer therefore removes the observer before it
+// deletes the handle, rather than leaving it to dealloc.
+- (void)stopObservingState
+{
+    if (atomic_exchange(&_observingState, false)) {
+        [self removeObserver:_observer forKeyPath:@"state"];
+    }
+}
+
 - (void)dealloc
 {
-    [self removeObserver:_observer forKeyPath:@"state"];
+    [self stopObservingState];
     [_observer release];
     [_delegateWrapper release];
     [_disconnectedHandler release];
@@ -865,6 +882,26 @@ void *newVZVirtualMachineWithDispatchQueue(void *config, void *queue, uintptr_t 
                             queue:(dispatch_queue_t)queue
                statusUpdateHandle:statusUpdateCgoHandle
                disconnectedHandle:disconnectedCgoHandle];
+    }
+
+    RAISE_UNSUPPORTED_MACOS_EXCEPTION();
+}
+
+/*!
+ @abstract Remove the machine's state observer and wait until no state change can reach it any more.
+ @discussion
+    The framework changes a machine's state on the machine's queue and KVO
+    delivers on the mutating thread, so removing the observer on that
+    queue is ordered against every delivery: once this returns, none is
+    in flight and none can follow.
+ */
+void stopObservingVirtualMachineState(void *machine, void *queue)
+{
+    if (@available(macOS 11, *)) {
+        dispatch_sync((dispatch_queue_t)queue, ^{
+            [(ObservableVZVirtualMachine *)machine stopObservingState];
+        });
+        return;
     }
 
     RAISE_UNSUPPORTED_MACOS_EXCEPTION();

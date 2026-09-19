@@ -37,6 +37,7 @@ void closeAttachmentWasDisconnectedChannel(uintptr_t cgoHandle);
                                 queue:(dispatch_queue_t)queue
                    statusUpdateHandle:(uintptr_t)statusUpdateHandle
                    disconnectedHandle:(uintptr_t)disconnectedHandle;
+- (void)stopObservingState;
 - (void)dealloc;
 @end
 
@@ -115,6 +116,7 @@ void *VZVirtualMachine_memoryBalloonDevices(void *machine);
 
 /* VirtualMachine */
 void *newVZVirtualMachineWithDispatchQueue(void *config, void *queue, uintptr_t statusUpdateCgoHandle, uintptr_t disconnectedCgoHandle);
+void stopObservingVirtualMachineState(void *machine, void *queue);
 bool requestStopVirtualMachine(void *machine, void *queue, void **error);
 void startWithCompletionHandler(void *machine, void *queue, uintptr_t cgoHandle);
 void pauseWithCompletionHandler(void *machine, void *queue, uintptr_t cgoHandle);

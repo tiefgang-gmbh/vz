@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"runtime/cgo"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	infinity "github.com/Code-Hex/go-infinity-channel"
@@ -162,6 +163,13 @@ func NewVirtualMachine(config *VirtualMachineConfiguration) (*VirtualMachine, er
 	}
 
 	objc.SetFinalizer(v, func(self *VirtualMachine) {
+		// The machine can outlive this wrapper — the framework retains
+		// one that is starting or stopping, and so does a pending
+		// completion block — so finalize's release may not deallocate
+		// it. The observer goes first, while the queue and the machine
+		// are still ours, and on the machine's queue: after this call
+		// no state change can carry the handle deleted below.
+		C.stopObservingVirtualMachineState(objc.Ptr(self), self.dispatchQueue)
 		self.finalize()
 		stateHandle.Delete()
 		self.closeNotifications()
@@ -173,15 +181,17 @@ func (v *VirtualMachine) finalize() {
 	v.finalizeOnce.Do(func() {
 		objc.ReleaseDispatch(v.dispatchQueue)
 		// When this drops the last reference the machine is
-		// deallocated: its KVO observer is removed and its disconnect
-		// handler released, whose dealloc closes disconnectedIn.
+		// deallocated: its KVO observer is removed, unless the
+		// finalizer already has, and its disconnect handler released,
+		// whose dealloc closes disconnectedIn.
 		objc.Release(v)
 	})
 }
 
 // closeNotifications ends the notification channels once the Go
-// wrapper is being collected: the state handle is gone by then, so no
-// state change can be delivered any more, and nothing can subscribe.
+// wrapper is being collected: the state observer is removed by then,
+// so no state change can be delivered any more, and nothing can
+// subscribe.
 // Each channel's buffer goroutine exits once its input is closed and
 // its buffer drained; a subscriber drains its own channel, an
 // unsubscribed one is drained here so that a machine nobody listened
@@ -253,16 +263,29 @@ func (v *VirtualMachine) USBControllers() []*USBController {
 
 //export changeStateOnObserver
 func changeStateOnObserver(newStateRaw C.int, cgoHandleUintptr C.uintptr_t) {
+	// The finalizer removes the observer before it deletes the handle,
+	// so no state change should arrive for a collected machine. One
+	// that did would panic on a framework thread, where nothing can
+	// recover it and the process dies with every other machine in it;
+	// dropping the event here is the better failure.
+	defer func() {
+		if recover() != nil {
+			droppedStateChanges.Add(1)
+		}
+	}()
 	stateHandle := cgo.Handle(cgoHandleUintptr)
-	// I expected it will not cause panic.
-	// if caused panic, that's unexpected behavior.
 	v, _ := stateHandle.Value().(*machineState)
 	v.mu.Lock()
+	defer v.mu.Unlock()
 	newState := VirtualMachineState(newStateRaw)
 	v.state = newState
 	v.stateNotify.In() <- newState
-	v.mu.Unlock()
 }
+
+// droppedStateChanges counts the state changes changeStateOnObserver
+// had to drop. It stays zero while the observer's removal holds, which
+// is what the lifetime test reads it for.
+var droppedStateChanges atomic.Int64
 
 // State represents execution state of the virtual machine.
 func (v *VirtualMachine) State() VirtualMachineState {
